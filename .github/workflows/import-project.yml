@@ -1,0 +1,33 @@
+name: Import project
+
+on:
+  push:
+    paths:
+      - .github/workflows/import-project.yml
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct and import project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .upload/chunk_* | base64 -d > /tmp/project.zip
+          rm -rf /tmp/project
+          mkdir -p /tmp/project
+          unzip -q /tmp/project.zip -d /tmp/project
+          cp -a /tmp/project/. .
+          rm -rf .upload
+          rm -f .github/workflows/import-project.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Import Telegram direct bot project"
+          git push
