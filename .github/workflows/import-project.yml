@@ -17,12 +17,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .upload/chunk_* | base64 -d > /tmp/project.zip
+          cat .stage/part_00 .upload/chunk_01 .stage/part_04 .stage/part_05a .stage/part_05b1 .stage/part_05b2 > /tmp/project.b64
+          base64 -d /tmp/project.b64 > /tmp/project.zip
+          echo "512d78f99a323b647b71fdf16c59b2aaf0181748093259b03c8bc2317b35f3c5  /tmp/project.zip" | sha256sum -c -
+          unzip -t /tmp/project.zip
           rm -rf /tmp/project
           mkdir -p /tmp/project
           unzip -q /tmp/project.zip -d /tmp/project
           cp -a /tmp/project/. .
-          rm -rf .upload
+          rm -rf .stage .upload
           rm -f .github/workflows/import-project.yml
           rmdir .github/workflows 2>/dev/null || true
           rmdir .github 2>/dev/null || true
