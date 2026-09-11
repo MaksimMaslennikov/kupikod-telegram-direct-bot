@@ -1,0 +1,14 @@
+{
+  "name": "telegram-channel-direct-messages-greeter",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Автоприветствие и маршрутизация личных сообщений Telegram-канала",
+  "type": "module",
+  "scripts": {
+    "start": "node src/bot.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}
