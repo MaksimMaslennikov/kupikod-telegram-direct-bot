@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import {
   CLOSED_TICKET_ARCHIVE_DELAY_MS,
@@ -228,6 +231,12 @@ describe("ChannelDirectMessagesBot", () => {
     await bot.handleCallback(actionCallback("confirm_request"));
     assert.match(api.calls.at(-1).payload.text, /Обращение №1 отправлено/);
     assert.notDeepEqual(api.calls.at(-1).payload.reply_markup, MENU_KEYBOARD);
+    assert.ok(api.calls.at(-1).payload.reply_markup.inline_keyboard.flat().some((button) =>
+      button.callback_data === "action:ticket_status" && button.text === "📋 Статус"
+    ));
+    assert.ok(api.calls.at(-1).payload.reply_markup.inline_keyboard.flat().some((button) =>
+      button.callback_data === "action:close_ticket" && button.text === "✅ Завершить вопрос"
+    ));
     assert.equal(storage.listTickets()[0].status, "open");
 
     await bot.handleMessage(userMessage("Хочу добавить деталь к обращению"));
@@ -391,6 +400,29 @@ describe("сортировка обращений", () => {
   });
 });
 
+describe("состояние между перезапусками", () => {
+  test("сохраняет выбранный ответ и Telegram offset в SQLite", () => {
+    const temporaryDirectory = mkdtempSync(join(tmpdir(), "direct-kupikod-bot-"));
+    const databasePath = join(temporaryDirectory, "state.sqlite3");
+    let storage = new Storage(databasePath);
+    try {
+      storage.setAdminReplyTicket(292141127, 17, 1000);
+      storage.setTelegramUpdateOffset(414400200);
+      storage.close();
+
+      storage = new Storage(databasePath);
+      assert.equal(storage.getAdminReplyTicketId(292141127), 17);
+      assert.equal(storage.getTelegramUpdateOffset(), 414400200);
+
+      storage.clearAdminReplyTicket(292141127);
+      assert.equal(storage.getAdminReplyTicketId(292141127), null);
+    } finally {
+      try { storage.close(); } catch {}
+      rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("администраторская панель", () => {
   let api;
   let storage;
@@ -427,7 +459,7 @@ describe("администраторская панель", () => {
     assert.equal(storage.inboxCounts().unread, 1);
   });
 
-  test("показывает входящие, архивирует и отправляет ответ пользователю", async () => {
+  test("показывает входящие, запрещает архивировать открытое и отправляет ответ", async () => {
     await bot.handleMessage(userMessage("Нужна помощь"));
     await bot.handleCallback(callback("other"));
     await bot.handleCallback(actionCallback("confirm_request"));
@@ -440,8 +472,14 @@ describe("администраторская панель", () => {
     assert.match(api.calls.at(-1).payload.text, /История — последние 20:/);
     assert.match(api.calls.at(-1).payload.text, /Пользователь.*<blockquote>Нужна помощь<\/blockquote>/s);
     assert.equal(storage.inboxCounts().unread, 0);
+    assert.ok(!api.calls.at(-1).payload.reply_markup.inline_keyboard.flat().some((button) =>
+      button.callback_data === "admin:archive:1"
+    ));
 
     await bot.handleUpdate({ callback_query: adminCallback("admin:reply:1") });
+    bot = new ChannelDirectMessagesBot({
+      api, storage, adminUserId: 292141127, now: () => 1000
+    });
     await bot.handleUpdate({ message: adminMessage("Здравствуйте, уже проверяем.", 88) });
     const relay = api.calls.find((call) =>
       call.method === "copyMessage" && call.payload.message_id === 88
@@ -452,6 +490,19 @@ describe("администраторская панель", () => {
     await bot.handleUpdate({ callback_query: adminCallback("admin:view:1") });
     assert.match(api.calls.at(-1).payload.text, /Вы.*<blockquote>Здравствуйте, уже проверяем\.<\/blockquote>/s);
 
+    await bot.handleUpdate({ callback_query: adminCallback("admin:archive:1") });
+    assert.match(api.calls.at(-1).payload.text, /Открытое обращение №1 нельзя отправить в архив/);
+    assert.equal(storage.getTicket(1).archived, 0);
+    assert.equal(storage.inboxCounts().open, 1);
+
+    await bot.handleMessage(userMessage("Дополнение после попытки архивации"));
+    assert.equal(storage.getTicket(1).unread, 1);
+    assert.deepEqual(storage.listInbox({ mode: "new" }).map((ticket) => ticket.id), [1]);
+
+    await bot.handleUpdate({ callback_query: adminCallback("admin:close:1") });
+    assert.ok(api.calls.at(-1).payload.reply_markup.inline_keyboard.flat().some((button) =>
+      button.callback_data === "admin:archive:1"
+    ));
     await bot.handleUpdate({ callback_query: adminCallback("admin:archive:1") });
     assert.equal(storage.inboxCounts().archived, 1);
   });
@@ -508,6 +559,71 @@ describe("администраторская панель", () => {
     await bot.handleMessage(userMessage("Новый вопрос после закрытия"));
     assert.equal(api.calls.at(-1).payload.text, WELCOME_TEXT);
     assert.equal(storage.listTickets().length, 1);
+  });
+
+  test("не возобновляет старое обращение поверх другого активного", async () => {
+    await bot.handleMessage(userMessage("Первое обращение"));
+    await bot.handleCallback(callback("other"));
+    await bot.handleCallback(actionCallback("confirm_request"));
+    await bot.handleUpdate({ callback_query: adminCallback("admin:close:1") });
+
+    await bot.handleMessage(userMessage("Второе обращение"));
+    await bot.handleCallback(callback("partnership"));
+    await bot.handleCallback(actionCallback("confirm_request"));
+    assert.equal(storage.getConversation(-100777, 900719925474000).active_ticket_id, 2);
+
+    await bot.handleUpdate({ callback_query: adminCallback("admin:reopen:1") });
+
+    assert.equal(storage.getTicket(1).status, "closed");
+    assert.equal(storage.getTicket(2).status, "open");
+    assert.equal(storage.getConversation(-100777, 900719925474000).active_ticket_id, 2);
+    assert.match(api.calls.at(-1).payload.text, /Нельзя возобновить обращение №1/);
+    assert.match(api.calls.at(-1).payload.text, /уже открыто обращение №2/);
+
+    await bot.handleMessage(userMessage("Дополнение после попытки возобновления"));
+    assert.deepEqual(storage.listTicketMessages(1).map((entry) => entry.text), [
+      "Первое обращение"
+    ]);
+    assert.deepEqual(storage.listTicketMessages(2).map((entry) => entry.text), [
+      "Второе обращение",
+      "Дополнение: Дополнение после попытки возобновления"
+    ]);
+  });
+
+  test("ответ администратора не возобновляет тикет и не портит новый черновик", async () => {
+    await bot.handleMessage(userMessage("Старое обращение"));
+    await bot.handleCallback(callback("other"));
+    await bot.handleCallback(actionCallback("confirm_request"));
+    await bot.handleUpdate({ callback_query: adminCallback("admin:close:1") });
+    await bot.handleUpdate({ callback_query: adminCallback("admin:archive:1") });
+
+    await bot.handleMessage(userMessage("Черновик нового обращения"));
+    const draftBeforeReply = storage.getConversation(-100777, 900719925474000);
+    assert.equal(draftBeforeReply.state, "awaiting_section");
+    assert.equal(draftBeforeReply.pending_message_text, "Черновик нового обращения");
+    assert.equal(draftBeforeReply.active_ticket_id, null);
+
+    await bot.handleUpdate({ callback_query: adminCallback("admin:reply:1") });
+    await bot.handleUpdate({ message: adminMessage("Поздний ответ по старому вопросу", 89) });
+
+    const oldTicket = storage.getTicket(1);
+    const draftAfterReply = storage.getConversation(-100777, 900719925474000);
+    assert.equal(oldTicket.status, "closed");
+    assert.equal(oldTicket.archived, 1);
+    assert.equal(draftAfterReply.state, "awaiting_section");
+    assert.equal(draftAfterReply.pending_message_text, "Черновик нового обращения");
+    assert.equal(draftAfterReply.active_ticket_id, null);
+
+    await bot.handleCallback(callback("partnership"));
+    await bot.handleCallback(actionCallback("confirm_request"));
+
+    assert.equal(storage.getTicket(1).status, "closed");
+    assert.equal(storage.getTicket(1).archived, 1);
+    assert.equal(storage.getTicket(2).status, "open");
+    assert.deepEqual(storage.listTicketMessages(2).map((entry) => entry.text), [
+      "Черновик нового обращения"
+    ]);
+    assert.equal(storage.getConversation(-100777, 900719925474000).active_ticket_id, 2);
   });
 
   test("сохраняет дополнение без отдельного уведомления администратора", async () => {

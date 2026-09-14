@@ -15,6 +15,7 @@ try {
     DELETE FROM giveaway_claims;
     DELETE FROM tickets;
     DELETE FROM conversations;
+    DELETE FROM admin_reply_sessions;
     DELETE FROM sqlite_sequence
       WHERE name IN ('ticket_messages', 'giveaway_claims', 'tickets');
     COMMIT;

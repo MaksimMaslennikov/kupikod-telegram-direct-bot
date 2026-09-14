@@ -123,6 +123,10 @@ function submittedTicketKeyboard(section) {
     { text: "➕ Дополнить заявку", callback_data: "action:add_details" },
     { text: "✏️ Исправить заявку", callback_data: "action:correct_ticket" }
   ]);
+  rows.push([
+    { text: "📋 Статус", callback_data: "action:ticket_status" },
+    { text: "✅ Завершить вопрос", callback_data: "action:close_ticket" }
+  ]);
   return { inline_keyboard: rows };
 }
 
@@ -227,6 +231,17 @@ export class Storage {
         submitted_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS admin_reply_sessions (
+        admin_user_id TEXT PRIMARY KEY,
+        ticket_id INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS bot_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS giveaway_claims_topic
       ON giveaway_claims (chat_id, topic_id, submitted_at);
 
@@ -285,6 +300,10 @@ export class Storage {
       CREATE INDEX IF NOT EXISTS tickets_inbox
       ON tickets (archived, unread, updated_at)
     `);
+    this.db.prepare(`
+      UPDATE tickets SET archived = 0
+      WHERE status = 'open' AND archived = 1
+    `).run();
   }
 
   getConversation(chatId, topicId) {
@@ -526,9 +545,15 @@ export class Storage {
   }
 
   setTicketArchived(ticketId, archived, now) {
-    this.db.prepare(`
-      UPDATE tickets SET archived = ?, unread = 0, updated_at = ? WHERE id = ?
-    `).run(archived ? 1 : 0, now, ticketId);
+    const result = archived
+      ? this.db.prepare(`
+          UPDATE tickets SET archived = 1, unread = 0, updated_at = ?
+          WHERE id = ? AND status = 'closed'
+        `).run(now, ticketId)
+      : this.db.prepare(`
+          UPDATE tickets SET archived = 0, unread = 0, updated_at = ? WHERE id = ?
+        `).run(now, ticketId);
+    return Number(result.changes) > 0;
   }
 
   closeTicket(ticketId, now) {
@@ -566,9 +591,20 @@ export class Storage {
 
   reopenTicket(ticketId, now) {
     const ticket = this.getTicket(ticketId);
-    if (!ticket) return null;
+    if (!ticket) return { status: "not_found", ticket: null, activeTicket: null };
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const activeTicket = this.db.prepare(`
+        SELECT * FROM tickets
+        WHERE chat_id = ? AND topic_id = ? AND status = 'open' AND id != ?
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1
+      `).get(ticket.chat_id, ticket.topic_id, ticketId);
+      if (activeTicket) {
+        this.db.exec("ROLLBACK");
+        return { status: "conflict", ticket, activeTicket };
+      }
+
       this.db.prepare(`
         UPDATE tickets SET status = 'open', archived = 0, closed_at = NULL, updated_at = ?
         WHERE id = ?
@@ -582,7 +618,11 @@ export class Storage {
           active_ticket_id = excluded.active_ticket_id, updated_at = excluded.updated_at
       `).run(ticket.chat_id, ticket.topic_id, ticket.section, ticketId, now);
       this.db.exec("COMMIT");
-      return ticket;
+      return {
+        status: ticket.status === "open" ? "already_open" : "reopened",
+        ticket: this.getTicket(ticketId),
+        activeTicket: null
+      };
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
@@ -691,6 +731,46 @@ export class Storage {
              created_at, updated_at, closed_at
       FROM tickets ORDER BY id
     `).all();
+  }
+
+  setAdminReplyTicket(adminId, ticketId, now) {
+    this.db.prepare(`
+      INSERT INTO admin_reply_sessions (admin_user_id, ticket_id, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(admin_user_id) DO UPDATE SET
+        ticket_id = excluded.ticket_id,
+        updated_at = excluded.updated_at
+    `).run(String(adminId), ticketId, now);
+  }
+
+  getAdminReplyTicketId(adminId) {
+    const row = this.db.prepare(`
+      SELECT ticket_id FROM admin_reply_sessions WHERE admin_user_id = ?
+    `).get(String(adminId));
+    return row ? Number(row.ticket_id) : null;
+  }
+
+  clearAdminReplyTicket(adminId) {
+    this.db.prepare("DELETE FROM admin_reply_sessions WHERE admin_user_id = ?")
+      .run(String(adminId));
+  }
+
+  getTelegramUpdateOffset() {
+    const row = this.db.prepare("SELECT value FROM bot_state WHERE key = 'telegram_update_offset'")
+      .get();
+    if (!row) return 0;
+    const offset = Number(row.value);
+    return Number.isSafeInteger(offset) && offset >= 0 ? offset : 0;
+  }
+
+  setTelegramUpdateOffset(offset) {
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      throw new Error("Некорректный Telegram update offset");
+    }
+    this.db.prepare(`
+      INSERT INTO bot_state (key, value) VALUES ('telegram_update_offset', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(String(offset));
   }
 
   close() {
@@ -804,7 +884,6 @@ export class ChannelDirectMessagesBot {
     this.adminUserIds = new Set(
       [...adminUserIds, adminUserId].filter((id) => id != null).map(Number)
     );
-    this.adminReplyTicketIds = new Map();
     this.channelCache = new Map();
     this.now = now;
   }
@@ -1050,16 +1129,21 @@ export class ChannelDirectMessagesBot {
       omittedHistory = true;
     }
     const history = `${omittedHistory ? "Более ранние сообщения скрыты…\n" : ""}${historyBlocks.join("\n")}`;
+    const managementButtons = [
+      ticket.status === "open"
+        ? { text: "✅ Закрыть", callback_data: `admin:close:${ticket.id}` }
+        : { text: "🔁 Возобновить", callback_data: `admin:reopen:${ticket.id}` }
+    ];
+    if (ticket.archived) {
+      managementButtons.push({
+        text: "📤 Вернуть из архива", callback_data: `admin:restore:${ticket.id}`
+      });
+    } else if (ticket.status === "closed") {
+      managementButtons.push({ text: "🗄 В архив", callback_data: `admin:archive:${ticket.id}` });
+    }
     const keyboard = [
       [{ text: "✍️ Ответить", callback_data: `admin:reply:${ticket.id}` }],
-      [
-        ticket.status === "open"
-          ? { text: "✅ Закрыть", callback_data: `admin:close:${ticket.id}` }
-          : { text: "🔁 Возобновить", callback_data: `admin:reopen:${ticket.id}` },
-        ticket.archived
-          ? { text: "📤 Вернуть из архива", callback_data: `admin:restore:${ticket.id}` }
-          : { text: "🗄 В архив", callback_data: `admin:archive:${ticket.id}` }
-      ],
+      managementButtons,
       [{ text: "🏠 Главная", callback_data: "admin:home" }]
     ];
     await this.sendAdmin(
@@ -1071,10 +1155,10 @@ export class ChannelDirectMessagesBot {
 
   async relayAdminReply(message) {
     const adminId = message.from.id;
-    const ticketId = this.adminReplyTicketIds.get(adminId);
+    const ticketId = this.storage.getAdminReplyTicketId(adminId);
     const ticket = this.storage.getTicket(ticketId);
     if (!ticket) {
-      this.adminReplyTicketIds.delete(adminId);
+      this.storage.clearAdminReplyTicket(adminId);
       await this.sendAdmin(adminId, "Обращение больше не найдено.");
       return;
     }
@@ -1094,11 +1178,10 @@ export class ChannelDirectMessagesBot {
       });
     }
     const now = this.now();
-    this.storage.reopenTicket(ticketId, now);
     this.storage.recordTicketMessage(
       ticketId, "admin", message.message_id, describeMessage(message), now
     );
-    this.adminReplyTicketIds.delete(adminId);
+    this.storage.clearAdminReplyTicket(adminId);
     await this.sendAdmin(adminId, `Ответ отправлен пользователю в обращение №${ticketId}.`, {
       inline_keyboard: [[
         { text: "Открыть обращение", callback_data: `admin:view:${ticketId}` },
@@ -1118,17 +1201,17 @@ export class ChannelDirectMessagesBot {
     }
     const text = message.text ?? "";
     if (/^\/cancel(?:@\w+)?(?:\s|$)/i.test(text)) {
-      this.adminReplyTicketIds.delete(adminId);
+      this.storage.clearAdminReplyTicket(adminId);
       await this.sendAdmin(adminId, "Ответ отменён.");
       await this.sendAdminDashboard(adminId);
       return;
     }
     if (/^\/(?:start|admin|inbox)(?:@\w+)?(?:\s|$)/i.test(text)) {
-      this.adminReplyTicketIds.delete(adminId);
+      this.storage.clearAdminReplyTicket(adminId);
       await this.sendAdminDashboard(adminId);
       return;
     }
-    if (this.adminReplyTicketIds.has(adminId)) {
+    if (this.storage.getAdminReplyTicketId(adminId) != null) {
       await this.relayAdminReply(message);
       return;
     }
@@ -1158,14 +1241,34 @@ export class ChannelDirectMessagesBot {
     if (command === "reply") {
       const ticket = this.storage.getTicket(ticketId);
       if (!ticket) return this.sendAdmin(adminId, "Обращение не найдено.");
-      this.adminReplyTicketIds.set(adminId, ticketId);
+      this.storage.setAdminReplyTicket(adminId, ticketId, now);
       return this.sendAdmin(
         adminId,
         `Отправьте ответ для обращения №${ticketId}. Можно прислать текст, фото или документ. Для отмены — /cancel.`
       );
     }
-    if (command === "archive") this.storage.setTicketArchived(ticketId, true, now);
-    if (command === "restore") this.storage.setTicketArchived(ticketId, false, now);
+    if (command === "archive") {
+      const ticket = this.storage.getTicket(ticketId);
+      if (!ticket) return this.sendAdmin(adminId, "Обращение не найдено.");
+      if (ticket.status === "open") {
+        return this.sendAdmin(
+          adminId,
+          `<b>⚠️ Открытое обращение №${ticketId} нельзя отправить в архив</b>\n\nСначала закройте его. После этого появится кнопка «🗄 В архив».`,
+          {
+            inline_keyboard: [
+              [{ text: `✅ Закрыть №${ticketId}`, callback_data: `admin:close:${ticketId}` }],
+              [{ text: `← Обращение №${ticketId}`, callback_data: `admin:view:${ticketId}` }]
+            ]
+          }
+        );
+      }
+      this.storage.setTicketArchived(ticketId, true, now);
+      return this.sendAdminTicket(adminId, ticketId);
+    }
+    if (command === "restore") {
+      this.storage.setTicketArchived(ticketId, false, now);
+      return this.sendAdminTicket(adminId, ticketId);
+    }
     if (command === "close") {
       const ticket = this.storage.getTicket(ticketId);
       if (ticket?.status === "open") {
@@ -1174,7 +1277,28 @@ export class ChannelDirectMessagesBot {
       }
       return this.sendAdminTicket(adminId, ticketId);
     }
-    if (command === "reopen") this.storage.reopenTicket(ticketId, now);
+    if (command === "reopen") {
+      const result = this.storage.reopenTicket(ticketId, now);
+      if (result.status === "not_found") {
+        return this.sendAdmin(adminId, "Обращение не найдено.");
+      }
+      if (result.status === "conflict") {
+        return this.sendAdmin(
+          adminId,
+          `<b>⚠️ Нельзя возобновить обращение №${ticketId}</b>\n\nУ этого пользователя уже открыто обращение №${result.activeTicket.id}. Сначала закройте его, затем повторите возобновление.`,
+          {
+            inline_keyboard: [
+              [{
+                text: `📂 Открыть активное №${result.activeTicket.id}`,
+                callback_data: `admin:view:${result.activeTicket.id}`
+              }],
+              [{ text: `← Обращение №${ticketId}`, callback_data: `admin:view:${ticketId}` }],
+              [{ text: "🏠 Главная", callback_data: "admin:home" }]
+            ]
+          }
+        );
+      }
+    }
     return this.sendAdminTicket(adminId, ticketId);
   }
 
@@ -1585,7 +1709,7 @@ export async function run() {
   });
 
   let running = true;
-  let offset = 0;
+  let offset = storage.getTelegramUpdateOffset();
   let nextArchiveSweepAt = 0;
   const stop = () => { running = false; };
   process.once("SIGINT", stop);
@@ -1615,12 +1739,14 @@ export async function run() {
           allowed_updates: ["message", "callback_query"]
         });
         for (const update of updates) {
-          offset = update.update_id + 1;
           try {
             await bot.handleUpdate(update);
           } catch (error) {
             console.error(`Ошибка обработки update ${update.update_id}:`, error.message);
             if (logLevel === "debug") console.error(error);
+          } finally {
+            offset = update.update_id + 1;
+            storage.setTelegramUpdateOffset(offset);
           }
         }
       } catch (error) {
