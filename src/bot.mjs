@@ -462,6 +462,16 @@ export class Storage {
     }
   }
 
+  getLastTicketMessage(ticketId) {
+    return this.db.prepare(`
+      SELECT id, direction, telegram_message_id, text, created_at
+      FROM ticket_messages
+      WHERE ticket_id = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `).get(ticketId);
+  }
+
   setConversationState(chatId, topicId, state, now, { clearPending = false } = {}) {
     this.db.prepare(`
       UPDATE conversations SET
@@ -975,18 +985,23 @@ export class ChannelDirectMessagesBot {
   async recordAndNotify(ticketId, context, message, textOverride = "") {
     const timestamp = message?.date ? message.date * 1000 : this.now();
     const text = textOverride || describeMessage(message);
+    const previousMessage = this.storage.getLastTicketMessage(ticketId);
     this.storage.recordTicketMessage(
       ticketId, "user", message?.message_id ?? null, text, timestamp, { unread: true }
     );
     const recordedTicket = this.storage.getTicket(ticketId);
-    if (this.adminUserIds.size === 0 || recordedTicket?.message_count > 1) return;
+    const isNewTicket = previousMessage == null;
+    const isReplyAfterAdmin = previousMessage?.direction === "admin";
+    if (this.adminUserIds.size === 0 || (!isNewTicket && !isReplyAfterAdmin)) return;
 
     try {
       const channel = await this.resolveChannel(context);
       this.storage.updateTicketChannel(ticketId, channel);
       const ticket = this.storage.getTicket(ticketId);
       const channelName = channel.username ? `${channel.title} (@${channel.username})` : channel.title;
-      const notificationTitle = `🔔 Новое обращение №${ticketId}`;
+      const notificationTitle = isNewTicket
+        ? `🔔 Новое обращение №${ticketId}`
+        : `💬 Новый ответ пользователя · обращение №${ticketId}`;
       for (const adminId of this.adminUserIds) {
         try {
           await this.api.call("sendMessage", {

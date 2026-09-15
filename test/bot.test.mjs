@@ -655,6 +655,37 @@ describe("администраторская панель", () => {
     ]);
   });
 
+  test("уведомляет о первом сообщении пользователя после ответа администратора", async () => {
+    await bot.handleMessage(userMessage("Первое сообщение"));
+    await bot.handleCallback(callback("partnership"));
+    await bot.handleCallback(actionCallback("confirm_request"));
+
+    await bot.handleUpdate({ callback_query: adminCallback("admin:reply:1") });
+    await bot.handleUpdate({ message: adminMessage("Ответ администратора", 91) });
+
+    await bot.handleMessage(userMessage("Ответ пользователя после администратора"));
+
+    let replyNotifications = api.calls.filter((call) =>
+      call.method === "sendMessage" &&
+      call.payload.chat_id === 292141127 &&
+      /Новый ответ пользователя · обращение №1/.test(call.payload.text)
+    );
+    assert.equal(replyNotifications.length, 1);
+    assert.match(
+      replyNotifications[0].payload.text,
+      /<blockquote>Дополнение: Ответ пользователя после администратора<\/blockquote>/
+    );
+    assert.equal(storage.getTicket(1).unread, 1);
+
+    await bot.handleMessage(userMessage("Ещё одно сообщение подряд"));
+    replyNotifications = api.calls.filter((call) =>
+      call.method === "sendMessage" &&
+      call.payload.chat_id === 292141127 &&
+      /Новый ответ пользователя · обращение №1/.test(call.payload.text)
+    );
+    assert.equal(replyNotifications.length, 1, "сообщения подряд не должны создавать спам");
+  });
+
   test("экранирует разметку из пользовательского текста", async () => {
     await bot.handleMessage(userMessage("<b>не формат</b> & текст"));
     await bot.handleCallback(callback("other"));
